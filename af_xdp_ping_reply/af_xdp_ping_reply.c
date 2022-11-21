@@ -73,6 +73,13 @@ struct xsk_socket_info {
 static bool global_exit = false;
 static int verbose = 1;
 
+struct my_config {
+    __u32 xdp_flags;
+    struct iface iface;
+    __u16 xsk_bind_flags;
+    int xsk_if_queue;
+    bool xsk_poll_mode;
+};
 
 static const struct loadopt {
     bool help;
@@ -86,21 +93,30 @@ static const struct loadopt {
     __u32 xdp_flags;
     int xsk_if_queue;
     bool xsk_poll_mode;
+    bool xsk_copy_mode;
+    bool xsk_zero_copy_mode;
 } defaults_load = {
         .mode = XDP_MODE_NATIVE,
         .xsk_bind_flags = XDP_COPY,
         .xdp_flags = XDP_FLAGS_SKB_MODE,
         .xsk_if_queue = 0,
-        .xsk_poll_mode = true
+        .xsk_poll_mode = false,
+        .xsk_copy_mode = false,
+        .xsk_zero_copy_mode = false
 };
-
+//enum xdp_attach_mode {
+//    XDP_MODE_UNSPEC = 0,
+//    XDP_MODE_NATIVE,
+//    XDP_MODE_SKB,
+//    XDP_MODE_HW
+//};
 struct enum_val xdp_modes[] = {
         {"native",      XDP_MODE_NATIVE},
         {"skb",         XDP_MODE_SKB},
         {"hw",          XDP_MODE_HW},
         {"unspecified", XDP_MODE_UNSPEC},
         {NULL,          0}
-};
+}; // 这是一个enum_val结构体数组
 
 /** my functions **/
 
@@ -155,7 +171,7 @@ static uint64_t xsk_umem_free_frames(struct xsk_socket_info *xsk) {
     return xsk->umem_frame_free;
 }
 
-static struct xsk_socket_info *xsk_configure_socket(const struct loadopt *opt,
+static struct xsk_socket_info *xsk_configure_socket(struct my_config *opt,
                                                     struct xsk_umem_info *umem) {
     struct xsk_socket_config xsk_cfg;
     struct xsk_socket_info *xsk_info;
@@ -184,8 +200,6 @@ static struct xsk_socket_info *xsk_configure_socket(const struct loadopt *opt,
     ret = bpf_xdp_query_id(opt->iface.ifindex, opt->xdp_flags, &prog_id);
     if (ret)
         goto error_exit;
-    printf("WPDEBUG: bpf_get_link_xdp_id got prog_id %d\n", prog_id);
-
     /* Initialize umem frame allocation */
 
     for (i = 0; i < NUM_FRAMES; i++)
@@ -216,9 +230,7 @@ static struct xsk_socket_info *xsk_configure_socket(const struct loadopt *opt,
 }
 
 
-
-static void complete_tx(struct xsk_socket_info *xsk)
-{
+static void complete_tx(struct xsk_socket_info *xsk) {
     unsigned int completed;
     uint32_t idx_cq;
 
@@ -245,27 +257,8 @@ static void complete_tx(struct xsk_socket_info *xsk)
     }
 }
 
-static inline __sum16 csum16_add(__sum16 csum, __be16 addend)
-{
-    uint16_t res = (uint16_t)csum;
-
-    res += (__u16)addend;
-    return (__sum16)(res + (res < (__u16)addend));
-}
-
-static inline __sum16 csum16_sub(__sum16 csum, __be16 addend)
-{
-    return csum16_add(csum, ~addend);
-}
-
-static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
-{
-    *sum = ~csum16_add(csum16_sub(~(*sum), old), new);
-}
-
 static bool process_packet(struct xsk_socket_info *xsk,
-                           uint64_t addr, uint32_t len)
-{
+                           uint64_t addr, uint32_t len) {
     uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
     /* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
@@ -324,8 +317,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
     return false;
 }
 
-static void handle_receive_packets(struct xsk_socket_info *xsk)
-{
+static void handle_receive_packets(struct xsk_socket_info *xsk) {
     unsigned int rcvd, stock_frames, i;
     uint32_t idx_rx = 0, idx_fq = 0;
     int ret;
@@ -344,7 +336,7 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
                                      &idx_fq);
 
         /* This should not happen, but just in case */
-        while ((unsigned int)ret != stock_frames)
+        while ((unsigned int) ret != stock_frames)
             ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd,
                                          &idx_fq);
 
@@ -373,9 +365,8 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
     complete_tx(xsk);
 }
 
-static void rx_and_process(const struct loadopt *opt,
-                           struct xsk_socket_info *xsk_socket)
-{
+static void rx_and_process(struct my_config *opt,
+                           struct xsk_socket_info *xsk_socket) {
     struct pollfd fds[2];
     int ret, nfds = 1;
 
@@ -383,7 +374,7 @@ static void rx_and_process(const struct loadopt *opt,
     fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
     fds[0].events = POLLIN;
 
-    while(!global_exit) {
+    while (!global_exit) {
         if (opt->xsk_poll_mode) {
             ret = poll(fds, nfds, -1);
             if (ret <= 0 || ret > 1)
@@ -393,9 +384,8 @@ static void rx_and_process(const struct loadopt *opt,
     }
 }
 
-
-
 #define NANOSEC_PER_SEC 1000000000 /* 10^9 */
+
 static uint64_t gettime(void) {
     struct timespec t;
     int res;
@@ -435,23 +425,23 @@ static void stats_print(struct stats_record *stats_rec,
         period = 1;
 
     packets = stats_rec->rx_packets - stats_prev->rx_packets;
-    pps     = packets / period;
+    pps = packets / period;
 
-    bytes   = stats_rec->rx_bytes   - stats_prev->rx_bytes;
-    bps     = (bytes * 8) / period / 1000000;
+    bytes = stats_rec->rx_bytes - stats_prev->rx_bytes;
+    bps = (bytes * 8) / period / 1000000;
 
     printf(fmt, "AF_XDP RX:", stats_rec->rx_packets, pps,
-           stats_rec->rx_bytes / 1000 , bps,
+           stats_rec->rx_bytes / 1000, bps,
            period);
 
     packets = stats_rec->tx_packets - stats_prev->tx_packets;
-    pps     = packets / period;
+    pps = packets / period;
 
-    bytes   = stats_rec->tx_bytes   - stats_prev->tx_bytes;
-    bps     = (bytes * 8) / period / 1000000;
+    bytes = stats_rec->tx_bytes - stats_prev->tx_bytes;
+    bps = (bytes * 8) / period / 1000000;
 
     printf(fmt, "       TX:", stats_rec->tx_packets, pps,
-           stats_rec->tx_bytes / 1000 , bps,
+           stats_rec->tx_bytes / 1000, bps,
            period);
 
     printf("\n");
@@ -460,7 +450,7 @@ static void stats_print(struct stats_record *stats_rec,
 static void *stats_poll(void *arg) {
     unsigned int interval = 2;
     struct xsk_socket_info *xsk = arg;
-    static struct stats_record previous_stats = { 0 };
+    static struct stats_record previous_stats = {0};
 
     previous_stats.timestamp = gettime();
 
@@ -481,45 +471,11 @@ static void exit_application(int signal) {
     global_exit = true;
 }
 
-
 /** end of my functions **/
 
 
 
 
-
-
-
-
-static struct prog_option load_options[] = {
-        DEFINE_OPTION("mode", OPT_ENUM, struct loadopt, mode,
-        .short_opt = 'm',
-        .typearg = xdp_modes,
-        .metavar = "<mode>",
-        .help = "Load XDP program in <mode>; default native"),
-        DEFINE_OPTION("pin-path", OPT_STRING, struct loadopt, pin_path,
-        .short_opt = 'p',
-        .help = "Path to pin maps under (must be in bpffs)."),
-        DEFINE_OPTION("section", OPT_STRING, struct loadopt, section_name,
-        .metavar = "<section>",
-        .short_opt = 's',
-        .help = "ELF section name of program to load (default: first in file)."),
-        DEFINE_OPTION("prog-name", OPT_STRING, struct loadopt, prog_name,
-        .metavar = "<prog_name>",
-        .short_opt = 'n',
-        .help = "BPF program name of program to load (default: first in file)."),
-        DEFINE_OPTION("dev", OPT_IFNAME, struct loadopt, iface,
-        .positional = true,
-        .metavar = "<ifname>",
-        .required = true,
-        .help = "Load on device <ifname>"),
-        DEFINE_OPTION("filenames", OPT_MULTISTRING, struct loadopt, filenames,
-        .positional = true,
-        .metavar = "<filenames>",
-        .required = true,
-        .help = "Load programs from <filenames>"),
-        END_OPTIONS
-};
 
 
 static const struct unloadopt {
@@ -528,10 +484,200 @@ static const struct unloadopt {
     struct iface iface;
 } defaults_unload = {};
 
-int do_unload(const void *cfg, __unused const char *pin_root_path);
+
+static struct prog_option unload_options[] = {
+        DEFINE_OPTION("dev", OPT_IFNAME, struct unloadopt, iface,
+        .positional = true,
+        .metavar = "<ifname>",
+        .help = "Unload from device <ifname>"),
+        DEFINE_OPTION("id", OPT_U32, struct unloadopt, prog_id,
+        .metavar = "<id>",
+        .short_opt = 'i',
+        .help = "Unload program with id <id>"),
+        DEFINE_OPTION("all", OPT_BOOL, struct unloadopt, all,
+        .short_opt = 'a',
+        .help = "Unload all programs from interface"),
+        END_OPTIONS
+};
+
+int do_unload(const void *cfg, __unused const char *pin_root_path) {
+    const struct unloadopt *opt = cfg;
+    struct xdp_multiprog *mp = NULL;
+    enum xdp_attach_mode mode;
+    int err = EXIT_FAILURE;
+    DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts,
+            .pin_root_path = pin_root_path);
+
+    if (!opt->all && !opt->prog_id) {
+        pr_warn("Need prog ID or --all\n");
+        goto out;
+    }
+
+    if (!opt->iface.ifindex) {
+        pr_warn("Must specify ifname\n");
+        goto out;
+    }
+
+
+    mp = xdp_multiprog__get_from_ifindex(opt->iface.ifindex);
+    if (IS_ERR_OR_NULL(mp)) {
+        pr_warn("No XDP program loaded on %s\n", opt->iface.ifname);
+        mp = NULL;
+        goto out;
+    }
+
+    if (opt->all) {
+        err = xdp_multiprog__detach(mp);
+        if (err) {
+            pr_warn("Unable to detach XDP program: %s\n",
+                    strerror(-err));
+            goto out;
+        }
+    } else {
+        struct xdp_program *prog = NULL;
+
+        while ((prog = xdp_multiprog__next_prog(prog, mp))) {
+            if (xdp_program__id(prog) == opt->prog_id) {
+                mode = xdp_multiprog__attach_mode(mp);
+                goto found;
+            }
+        }
+
+        if (xdp_multiprog__is_legacy(mp)) {
+            prog = xdp_multiprog__main_prog(mp);
+            if (xdp_program__id(prog) == opt->prog_id) {
+                mode = xdp_multiprog__attach_mode(mp);
+                goto found;
+            }
+        }
+
+        prog = xdp_multiprog__hw_prog(mp);
+        if (xdp_program__id(prog) == opt->prog_id) {
+            mode = XDP_MODE_HW;
+            goto found;
+        }
+
+        pr_warn("Program with ID %u not loaded on %s\n",
+                opt->prog_id, opt->iface.ifname);
+        err = -ENOENT;
+        goto out;
+
+        found:
+        pr_debug("Detaching XDP program with ID %u from %s\n",
+                 xdp_program__id(prog), opt->iface.ifname);
+        err = xdp_program__detach(prog, opt->iface.ifindex, mode, 0);
+        if (err) {
+            pr_warn("Unable to detach XDP program: %s\n",
+                    strerror(-err));
+            goto out;
+        }
+    }
+
+    out:
+    xdp_multiprog__close(mp);
+    return err ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+
+static struct prog_option load_options[] = {
+        DEFINE_OPTION("mode", OPT_ENUM, struct loadopt, mode,
+        .short_opt = 'm',
+        .typearg = xdp_modes,
+        .metavar = "<mode>",
+        .help = "Load XDP program in <mode>; default native"),
+
+        DEFINE_OPTION("pin-path", OPT_STRING, struct loadopt, pin_path,
+        .short_opt = 'p',
+        .help = "Path to pin maps under (must be in bpffs)."),
+
+        DEFINE_OPTION("section", OPT_STRING, struct loadopt, section_name,
+        .metavar = "<section>",
+        .short_opt = 's',
+        .help = "ELF section name of program to load (default: first in file)."),
+
+        DEFINE_OPTION("prog-name", OPT_STRING, struct loadopt, prog_name,
+        .metavar = "<prog_name>",
+        .short_opt = 'n',
+        .help = "BPF program name of program to load (default: first in file)."),
+
+        DEFINE_OPTION("dev", OPT_IFNAME, struct loadopt, iface,
+        .positional = true,
+        .metavar = "<ifname>",
+        .required = true,
+        .help = "Load on device <ifname>"),
+
+        DEFINE_OPTION("filenames", OPT_MULTISTRING, struct loadopt, filenames,
+        .positional = true,
+        .metavar = "<filenames>",
+        .required = true,
+        .help = "Load programs from <filenames>"),
+
+        DEFINE_OPTION("poll-mode", OPT_BOOL, struct loadopt, xsk_poll_mode,
+        .short_opt = 'P',
+        .required = false,
+        .help = "Use the poll() API waiting for packets to arrive"),
+
+        DEFINE_OPTION("copy", OPT_BOOL, struct loadopt, xsk_copy_mode,
+        .short_opt = 'c',
+        .required = false,
+        .help = "Force copy mode"),
+
+        DEFINE_OPTION("zero-copy", OPT_BOOL, struct loadopt, xsk_zero_copy_mode,
+        .short_opt = 'z',
+        .required = false,
+        .help = "Force zero-copy mode"),
+
+        DEFINE_OPTION("queue", OPT_U32, struct loadopt, xsk_if_queue,
+        .short_opt = 'Q',
+        .metavar = "<queue_id>",
+        .required = false,
+        .help = "Configure interface receive queue for AF_XDP, default=0"),
+
+        END_OPTIONS
+};
+
 
 int do_load(const void *cfg, __unused const char *pin_root_path) {
+
     const struct loadopt *opt = cfg;
+    struct my_config my_cfg;
+
+    my_cfg.xsk_bind_flags = 0;
+    if (opt->xsk_copy_mode && opt->xsk_zero_copy_mode) {
+        pr_warn("Only one of --copy or --zero-copy can be set\n");
+        return EXIT_FAILURE;
+    } else if (opt->xsk_copy_mode) {
+        my_cfg.xsk_bind_flags |= XDP_COPY;
+    } else if (opt->xsk_zero_copy_mode) {
+        if (opt->mode == XDP_MODE_SKB) {
+            pr_warn("SKB mode does not support zero-copy mode\n");
+            return EXIT_FAILURE;
+        }
+        my_cfg.xsk_bind_flags |= XDP_ZEROCOPY;
+    }
+    my_cfg.xsk_poll_mode = opt->xsk_poll_mode;
+    my_cfg.xsk_if_queue = opt->xsk_if_queue;
+    my_cfg.iface = opt->iface;
+    my_cfg.xdp_flags = 0;
+    switch (opt->mode) {
+        case XDP_MODE_NATIVE:
+            my_cfg.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */// why we need clear it first?
+            my_cfg.xdp_flags |= XDP_FLAGS_DRV_MODE;  /* Set   flag */
+            break;
+        case XDP_MODE_SKB:
+            my_cfg.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */
+            my_cfg.xdp_flags |= XDP_FLAGS_DRV_MODE;  /* Set   flag */
+            break;
+        case XDP_MODE_HW:
+            my_cfg.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */
+            my_cfg.xdp_flags |= XDP_FLAGS_HW_MODE;  /* Set   flag */
+            break;
+        default:
+            pr_warn("No XDP mode specified\n");
+            return EXIT_FAILURE;
+    }
+
+
     struct xdp_program **progs, *p;
     char errmsg[STRERR_BUFSIZE];
     int err = EXIT_SUCCESS;
@@ -585,20 +731,14 @@ int do_load(const void *cfg, __unused const char *pin_root_path) {
         exit(EXIT_FAILURE);
     }
 
-    printf("WPDEBUG: UMEM created!\n");
 
     /** Open and configure the AF_XDP (xsk) socket **/
-    xsk_socket = xsk_configure_socket(opt, umem);
+    xsk_socket = xsk_configure_socket(&my_cfg, umem);
     if (xsk_socket == NULL) {
         fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
                 strerror(errno));
         exit(EXIT_FAILURE);
     }
-
-    printf("WPDEBUG: XSK created and prepared!\n");
-
-
-
 
 
     progs = calloc(num_progs, sizeof(*progs));
@@ -727,11 +867,10 @@ int do_load(const void *cfg, __unused const char *pin_root_path) {
         }
     }
 
-    rx_and_process(opt, xsk_socket);
+    rx_and_process(&my_cfg, xsk_socket);
 
     /** UMEM cleanup **/
     xsk_umem__delete(umem->umem);
-    printf("WPDEBUG: UMEM deleted!\n");
 
     const struct unloadopt unload_opt = {true, 0, opt->iface};
     do_unload(&unload_opt, NULL);
@@ -745,99 +884,6 @@ int do_load(const void *cfg, __unused const char *pin_root_path) {
     return err;
 }
 
-
-static struct prog_option unload_options[] = {
-        DEFINE_OPTION("dev", OPT_IFNAME, struct unloadopt, iface,
-        .positional = true,
-        .metavar = "<ifname>",
-        .help = "Unload from device <ifname>"),
-        DEFINE_OPTION("id", OPT_U32, struct unloadopt, prog_id,
-        .metavar = "<id>",
-        .short_opt = 'i',
-        .help = "Unload program with id <id>"),
-        DEFINE_OPTION("all", OPT_BOOL, struct unloadopt, all,
-        .short_opt = 'a',
-        .help = "Unload all programs from interface"),
-        END_OPTIONS
-};
-
-int do_unload(const void *cfg, __unused const char *pin_root_path) {
-    const struct unloadopt *opt = cfg;
-    struct xdp_multiprog *mp = NULL;
-    enum xdp_attach_mode mode;
-    int err = EXIT_FAILURE;
-    DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts,
-            .pin_root_path = pin_root_path);
-
-    if (!opt->all && !opt->prog_id) {
-        pr_warn("Need prog ID or --all\n");
-        goto out;
-    }
-
-    if (!opt->iface.ifindex) {
-        pr_warn("Must specify ifname\n");
-        goto out;
-    }
-
-
-    mp = xdp_multiprog__get_from_ifindex(opt->iface.ifindex);
-    if (IS_ERR_OR_NULL(mp)) {
-        pr_warn("No XDP program loaded on %s\n", opt->iface.ifname);
-        mp = NULL;
-        goto out;
-    }
-
-    if (opt->all) {
-        err = xdp_multiprog__detach(mp);
-        if (err) {
-            pr_warn("Unable to detach XDP program: %s\n",
-                    strerror(-err));
-            goto out;
-        }
-    } else {
-        struct xdp_program *prog = NULL;
-
-        while ((prog = xdp_multiprog__next_prog(prog, mp))) {
-            if (xdp_program__id(prog) == opt->prog_id) {
-                mode = xdp_multiprog__attach_mode(mp);
-                goto found;
-            }
-        }
-
-        if (xdp_multiprog__is_legacy(mp)) {
-            prog = xdp_multiprog__main_prog(mp);
-            if (xdp_program__id(prog) == opt->prog_id) {
-                mode = xdp_multiprog__attach_mode(mp);
-                goto found;
-            }
-        }
-
-        prog = xdp_multiprog__hw_prog(mp);
-        if (xdp_program__id(prog) == opt->prog_id) {
-            mode = XDP_MODE_HW;
-            goto found;
-        }
-
-        pr_warn("Program with ID %u not loaded on %s\n",
-                opt->prog_id, opt->iface.ifname);
-        err = -ENOENT;
-        goto out;
-
-        found:
-        pr_debug("Detaching XDP program with ID %u from %s\n",
-                 xdp_program__id(prog), opt->iface.ifname);
-        err = xdp_program__detach(prog, opt->iface.ifindex, mode, 0);
-        if (err) {
-            pr_warn("Unable to detach XDP program: %s\n",
-                    strerror(-err));
-            goto out;
-        }
-    }
-
-    out:
-    xdp_multiprog__close(mp);
-    return err ? EXIT_FAILURE : EXIT_SUCCESS;
-}
 
 static const struct statusopt {
     struct iface iface;
@@ -856,6 +902,7 @@ int do_status(const void *cfg, __unused const char *pin_root_path) {
     printf("CURRENT XDP PROGRAM STATUS:\n\n");
     return iface_print_status(opt->iface.ifindex ? &opt->iface : NULL);
 }
+
 
 static const struct cleanopt {
     struct iface iface;
