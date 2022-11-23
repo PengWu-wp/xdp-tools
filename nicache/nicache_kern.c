@@ -99,146 +99,157 @@ int nicache_main(struct xdp_md *ctx) {
             if (off < MAX_PACKET_LENGTH) {
                 /* push headers + "get " keyword */
                 if (bpf_xdp_adjust_head(ctx, ADJUST_HEAD_BYTES)) {
+//                    bpf_printk("first adjust failed\n");
                     return XDP_PASS;
                 }
             } else {
                 return XDP_PASS;
             }
 
-        //////////////////////////////////////////////////////////////////////////////////////
-        /// stage 2: parse key
+            //////////////////////////////////////////////////////////////////////////////////////
+            /// stage 2: parse key
 
-        data_end = (void *) (long) ctx->data_end;
-        data = (void *) (long) ctx->data;
-        payload = data;
+            data_end = (void *) (long) ctx->data_end;
+            data = (void *) (long) ctx->data;
+            payload = data;
 
-        struct key_entry key={0}; // 必须有初始化，否则无法加载，why？
-        unsigned short key_len = 0;
+            struct key_entry key = {0}; // 必须有初始化，否则无法加载，why？
+            unsigned short key_len = 0;
 
 //#pragma clang loop unroll(full)
 //            for (off = 0; off < MAX_KEY_LENGTH; off++) {
 //                key.data[off] = 0x00;
 //            }
-        // parse the key
+            // parse the key
 #pragma clang loop unroll(full)
-        for (off = 0; off < MAX_KEY_LENGTH && payload + off + 1 <= data_end; off++) {
-            if (payload[off] == '\r') {
-                break;
-            } else {
-                key.data[off] = payload[off];
-                key_len++;
-            }
-        }
-//        bpf_printk("parsed key is %s, len is %d\n", key.data, key_len);
-        struct cache_entry *value = bpf_map_lookup_elem(&cache_map, &key);
-        if (!value) {
-            bpf_xdp_adjust_head(ctx, -ADJUST_HEAD_BYTES);
-            return XDP_PASS;
-        } else {
-
-            //////////////////////////////////////////////////////////////////////////////////////
-            /// stage 3: cache hit, prepare the packet
-
-            // pop empty packet buffer memory to increase the available packet size
-            if (bpf_xdp_adjust_head(ctx, -ADJUST_HEAD_LEN)) {
-//                bpf_printk("adust head failed\n");
-                return XDP_PASS;
-            }
-//            bpf_printk("we are here\n");
-            data_end = (void *) (long) ctx->data_end;
-            data = (void *) (long) ctx->data;
-            eth = data;
-            ip = data + sizeof(*eth);
-            udp = data + sizeof(*eth) + sizeof(*ip);
-            struct memcached_udp_header *memcached_udp_hdr = data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp);
-            payload = (char *) (memcached_udp_hdr + 1);
-
-            void *old_data = data + ADJUST_HEAD_LEN - ADJUST_HEAD_BYTES;
-            if (payload >= data_end ||
-                old_data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr) >= data_end)
-                return XDP_PASS;
-
-            memmove(eth, old_data, sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr));
-
-            unsigned char tmp_mac[ETH_ALEN];
-            __be32 tmp_ip;
-            __be16 tmp_port;
-
-            memcpy(tmp_mac, eth->h_source, ETH_ALEN);
-            memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
-            memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
-
-            tmp_ip = ip->saddr;
-            ip->saddr = ip->daddr;
-            ip->daddr = tmp_ip;
-
-            tmp_port = udp->source;
-            udp->source = udp->dest;
-            udp->dest = tmp_port;
-
-
-            //////////////////////////////////////////////////////////////////////////////////////
-            /// stage 4: header prepared, write packet
-            unsigned short vlen_byte = (value->len > 9 ? 2 : 1);
-            unsigned short tmp = 6 + key_len + 3 + vlen_byte + 2 + value->len + 2 + 3 + 2;
-            // "VALUE " + key_len + " 0 " + vlen_byte + "0x0d 0x0a" + value_len + "0x0d 0x0a" + "END" + "0x0d 0x0a"
-
-            if (payload + tmp <= data_end) {
-                off = 0;
-                payload[off++] = 'V';
-                payload[off++] = 'A';
-                payload[off++] = 'L';
-                payload[off++] = 'U';
-                payload[off++] = 'E';
-                payload[off++] = ' ';
-#pragma clang loop unroll(disable)
-                for (int i = 0; i < key_len; i++) { // key
-                    payload[off++] = key.data[i];
-                }
-                payload[off++] = ' ';
-                payload[off++] = '0';
-                payload[off++] = ' ';
-
-                if (vlen_byte == 1) { // value len' len
-                    payload[off++] = value->len + '0';
+            for (off = 0; off < MAX_KEY_LENGTH; off++) {
+                if (payload + off + 1 <= data_end) {
+                    if (payload[off] == '\r') {
+                        break;
+                    } else {
+                        key.data[off] = payload[off];
+                        key_len++;
+                    }
                 } else {
-                    payload[off++] = value->len / 10 + '0';
-                    payload[off++] = value->len % 10 + '0';
+                    break;
                 }
-
-                payload[off++] = 0x0d;
-                payload[off++] = 0x0a;
-
-#pragma clang loop unroll(disable)
-                for (int i = 0; i < value->len && i < MAX_VAL_LENGTH; i++) { // value
-                    payload[off++] = value->data[i];
-                }
-
-                payload[off++] = 0x0d;
-                payload[off++] = 0x0a;
-
-                payload[off++] = 'E';
-                payload[off++] = 'N';
-                payload[off++] = 'D';
-
-                payload[off++] = 0x0d;
-                payload[off++] = 0x0a;
-
-
             }
-            udp->len = bpf_htons(tmp + 16);
-            ip->tot_len = bpf_htons(tmp + 36);
-            udp->check = 0;
-            ip->check = compute_ip_checksum(ip);
+//        bpf_printk("parsed key is %s, len is %d\n", key.data, key_len);
+            struct cache_entry *value = bpf_map_lookup_elem(&cache_map, &key);
+            if (!value) {
+                bpf_xdp_adjust_head(ctx, -ADJUST_HEAD_BYTES);
+                return XDP_PASS;
+            } else {
 
-            //////////////////////////////////////////////////////////////////////////////////////
-            /// stage 5: Trim and reply packet
-            bpf_xdp_adjust_tail(ctx, 0 - (80 - tmp + key_len));
-            return XDP_TX;
-        }
+                //////////////////////////////////////////////////////////////////////////////////////
+                /// stage 3: cache hit, prepare the packet
+
+                // pop empty packet buffer memory to increase the available packet size
+                if (bpf_xdp_adjust_head(ctx, -ADJUST_HEAD_LEN)) {
+                    return XDP_PASS;
+                }
+////            bpf_printk("we are here\n");
+                data_end = (void *) (long) ctx->data_end;
+                data = (void *) (long) ctx->data;
+                eth = data;
+                ip = data + sizeof(*eth);
+                udp = data + sizeof(*eth) + sizeof(*ip);
+                struct memcached_udp_header *memcached_udp_hdr = data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp);
+                payload = (char *) (memcached_udp_hdr + 1);
+
+                void *old_data = data + ADJUST_HEAD_LEN - ADJUST_HEAD_BYTES;
+                if (payload >= data_end ||
+                    old_data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr) >= data_end)
+                    return XDP_PASS;
+
+                memmove(eth, old_data, sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(*memcached_udp_hdr));
+
+                unsigned char tmp_mac[ETH_ALEN];
+                __be32 tmp_ip;
+                __be16 tmp_port;
+
+                memcpy(tmp_mac, eth->h_source, ETH_ALEN);
+                memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+                memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
+
+                tmp_ip = ip->saddr;
+                ip->saddr = ip->daddr;
+                ip->daddr = tmp_ip;
+
+                tmp_port = udp->source;
+                udp->source = udp->dest;
+                udp->dest = tmp_port;
+
+                //////////////////////////////////////////////////////////////////////////////////////
+                /// stage 4: header prepared, write packet
+                unsigned short vlen_byte = (value->len[1] == 0x00 ? 1 : 2);
+                unsigned short value_len = 0;
+                unsigned short tmp = 6 + key_len + 3 + vlen_byte + 2 + 2 + 3 + 2;
+//                unsigned short tmp = 6 + key_len + 3 + vlen_byte + 2 + value_len + 2 + 3 + 2;
+//                // "VALUE " + key_len + " 0 " + vlen_byte + "0x0d 0x0a" + value_len + "0x0d 0x0a" + "END" + "0x0d 0x0a"
+//
+                if (payload + tmp <= data_end) {
+                    off = 0;
+                    payload[off++] = 'V';
+                    payload[off++] = 'A';
+                    payload[off++] = 'L';
+                    payload[off++] = 'U';
+                    payload[off++] = 'E';
+                    payload[off++] = ' ';
+
+                    unsigned short iTmp = 0;
+#pragma clang loop unroll(full)
+                    for (; iTmp < MAX_KEY_LENGTH; iTmp++) {
+                        if (iTmp < key_len) payload[off++] = key.data[iTmp];
+                    }
+
+
+                    payload[off++] = ' ';
+                    payload[off++] = '0';
+                    payload[off++] = ' ';
+
+                    if (vlen_byte == 1) { // value len' len
+                        payload[off++] = value->len[0];
+                    } else {
+                        payload[off++] = value->len[1];
+                        payload[off++] = value->len[0];
+                    }
+
+                    payload[off++] = 0x0d;
+                    payload[off++] = 0x0a;
+
+#pragma clang loop unroll(full)
+                    for (unsigned short i = 0; i < MAX_VAL_LENGTH; i++) { // value
+                        if (value->data[i] != 0x00) {
+                            payload[off++] = value->data[i];
+                            value_len++;
+                        }
+                    }
+                    tmp += value_len;
+
+                    payload[off++] = 0x0d;
+                    payload[off++] = 0x0a;
+
+                    payload[off++] = 'E';
+                    payload[off++] = 'N';
+                    payload[off++] = 'D';
+
+                    payload[off++] = 0x0d;
+                    payload[off++] = 0x0a;
+
+                }
+                udp->len = bpf_htons(tmp + 16);
+                ip->tot_len = bpf_htons(tmp + 36);
+                udp->check = 0;
+                ip->check = compute_ip_checksum(ip);
+
+                //////////////////////////////////////////////////////////////////////////////////////
+                /// stage 5: Trim and reply packet
+                bpf_xdp_adjust_tail(ctx, 0 - (80 - tmp + key_len));
+                return XDP_TX;
+            }
         }
     }
-
 
     return XDP_PASS;
 }

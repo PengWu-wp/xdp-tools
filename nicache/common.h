@@ -20,7 +20,7 @@ struct key_entry {
 };
 
 struct cache_entry {
-    unsigned short len;
+    char len[2];
     char data[MAX_VAL_LENGTH];
 };
 

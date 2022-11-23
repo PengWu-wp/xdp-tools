@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
 
-TOOL_NAME := xdp-loader
-USER_TARGETS := xdp-loader
+TOOL_NAME := nicache_user
+USER_TARGETS := nicache_user
 XDP_TARGETS  := nicache_kern
 #TEST_FILE := tests/test-xdp-loader.sh
 #MAN_PAGE := xdp-loader.8
