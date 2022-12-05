@@ -666,7 +666,7 @@ int do_load(const void *cfg, __unused const char *pin_root_path) {
             break;
         case XDP_MODE_SKB:
             my_cfg.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */
-            my_cfg.xdp_flags |= XDP_FLAGS_DRV_MODE;  /* Set   flag */
+            my_cfg.xdp_flags |= XDP_FLAGS_SKB_MODE;  /* Set   flag */
             break;
         case XDP_MODE_HW:
             my_cfg.xdp_flags &= ~XDP_FLAGS_MODES;    /* Clear flags */
