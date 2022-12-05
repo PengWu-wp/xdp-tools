@@ -4,6 +4,7 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/in.h>
+
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
@@ -25,14 +26,15 @@ int xdp_prog(struct xdp_md *ctx)
 	struct iphdr *ip = data + sizeof(*eth);
 
 	off = sizeof(struct ethhdr);
-	if (data + off > data_end)
+	if (data + off > data_end) // To pass verifier
 		return XDP_PASS;
 
 	if (bpf_htons(eth->h_proto) == ETH_P_IP) {
-		off += sizeof(struct iphdr);
-		if (data + off > data_end)
+
+        off += sizeof(struct iphdr);
+		if (data + off > data_end) // To pass verifier
 			return XDP_PASS;
-		/* We process IPv4 ICMP ping pkts only. */
+		/* We redirect IPv4 ICMP pkts only. */
 		if (ip->protocol == IPPROTO_ICMP) {
 			int idx = ctx->rx_queue_index;
 			if (bpf_map_lookup_elem(&xsks_map, &idx)) {
