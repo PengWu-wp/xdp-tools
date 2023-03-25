@@ -30,13 +30,19 @@
 
 #define PROG_NAME "af_xdp_tx"
 
-#define NUM_FRAMES         4096
-#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH_SIZE      16
-//#define RX_BATCH_SIZE      4
+#define NUM_FRAMES      4096
+#define FRAME_SIZE      XSK_UMEM__DEFAULT_FRAME_SIZE
+#define BATCH_SIZE      32
+//#define BATCH_SIZE      64
 #define INVALID_UMEM_FRAME UINT64_MAX
 
 static bool global_exit = false;
+
+static char data[] = {0x00, 0x0c, 0x29, 0x3b, 0xd1, 0x44, 0x00, 0x0c, 0x29, 0x4d, 0x66, 0x3c, 0x08, 0x00, 0x45, 0xc0,
+                      0x00, 0x50, 0x91, 0xc0, 0x00, 0x00, 0x40, 0x01, 0x4c, 0xd3, 0xc0, 0xa8, 0x0d, 0x01, 0xc0, 0xa8,
+                      0x0d, 0x08, 0x03, 0x03, 0x98, 0x88, 0x00, 0x00, 0x00, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
 
 struct xsk_umem_info { // 该结构体是linux源码samples示例中用的，值得参考
     struct xsk_ring_prod fq; // fill ring
@@ -119,7 +125,7 @@ static struct prog_option send_options[] = {
         END_OPTIONS
 };
 
-/* 返回一个UMEM的地址（相对于UMEM起始地址的字节偏移量） */
+/* 返回一个UMEM的地址（相对于UMEM起始地址的字节偏移量），并将xsk_info里面的frame_free减一 */
 static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk_info) {
     uint64_t frame;
     if (xsk_info->umem_frame_free == 0)
@@ -191,28 +197,13 @@ static struct xsk_socket_info *xsk_configure_socket(const struct sendopt *opt,
                              &xsk_info->tx, &xsk_cfg);
     if (ret)
         goto error_exit;
-    printf("xsk socket configured\n");
+    printf("Success: xsk socket configured\n");
 
     /* Initialize umem frame allocation */
     for (i = 0; i < NUM_FRAMES; i++)
         xsk_info->umem_frame_addr[i] = i * FRAME_SIZE;
 
     xsk_info->umem_frame_free = NUM_FRAMES;
-
-    /* Stuff the receive path with buffers, we assume we have enough */
-    ret = xsk_ring_prod__reserve(&xsk_info->umem_info->fq,
-                                 XSK_RING_PROD__DEFAULT_NUM_DESCS,
-                                 &idx);
-
-    if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS)
-        goto error_exit;
-
-    for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i++)
-        *xsk_ring_prod__fill_addr(&xsk_info->umem_info->fq, idx++) =
-                xsk_alloc_umem_frame(xsk_info);
-
-    xsk_ring_prod__submit(&xsk_info->umem_info->fq,
-                          XSK_RING_PROD__DEFAULT_NUM_DESCS);
 
     return xsk_info;
 
@@ -227,7 +218,7 @@ static void xsk_free_umem_frame(struct xsk_socket_info *xsk_info, uint64_t frame
     xsk_info->umem_frame_addr[xsk_info->umem_frame_free++] = frame;
 }
 
-
+__attribute__((unused))
 static void complete_tx(struct xsk_socket_info *xsk_info) {
     unsigned int completed;
     uint32_t idx_cq;
@@ -243,6 +234,8 @@ static void complete_tx(struct xsk_socket_info *xsk_info) {
                                     XSK_RING_CONS__DEFAULT_NUM_DESCS,
                                     &idx_cq);
 
+//    printf("%d completed\n", completed);
+
     if (completed > 0) {
         for (unsigned int i = 0; i < completed; i++)
             xsk_free_umem_frame(xsk_info,
@@ -257,47 +250,42 @@ static void complete_tx(struct xsk_socket_info *xsk_info) {
 
 static void tx_process(const struct sendopt *opt,
                        struct xsk_socket_info *xsk_info) {
-    uint32_t idx, i;
+    unsigned int stock_frames;
+    uint32_t idx_tx = 0;
     int ret;
-    uint64_t addr;
-    uint32_t len;
-
-    char str[] = {0x00, 0x0c, 0x29, 0xbb, 0xd9, 0xcb, 0x00, 0x0c, 0x29, 0x4d, 0x66, 0x3c, 0x08, 0x00, 0x45, 0x00,
-                  0x00, 0x1d, 0x79, 0x36, 0x40, 0x00, 0x40, 0x11, 0x26, 0x46, 0xc0, 0xa8, 0x0d, 0x01, 0xc0, 0xa8,
-                  0x0d, 0x02, 0xe2, 0x87, 0x2b, 0xcb, 0x00, 0x09, 0x25, 0x35, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00,
-                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
 
     while (!global_exit) {
 //        sleep(1);
-        ret = xsk_ring_prod__reserve(&xsk_info->tx, RX_BATCH_SIZE, &idx);
-        if (ret != RX_BATCH_SIZE) {
-            /* No more transmit slots, drop the packet */
-            printf("ret is %d\n", ret);
+
+        ret = xsk_ring_prod__reserve(&xsk_info->tx,
+                                     BATCH_SIZE,
+                                     &idx_tx);
+
+        if (ret != BATCH_SIZE)
             return;
-        }
-//        printf("reserved %d descs, idx is %d\n", RX_BATCH_SIZE, idx);
 
-
-        for (i = 0; i < RX_BATCH_SIZE; ++i) {
-//        printf("populating idx %d\n", idx);
-            struct xdp_desc *desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx++);
+        /* Stuff all desc with static data */
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            struct xdp_desc *desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx++);
+            desc->addr = xsk_alloc_umem_frame(xsk_info); // 从后往前分配地址，frame_free--
             uint8_t *pkt = xsk_umem__get_data(xsk_info->umem_info->buffer, desc->addr);
-            memcpy(pkt, str, 60);
+            memcpy(pkt, data, 60);
             desc->len = 60;
-            xsk_info->umem_frame_free--;
+
+            xsk_info->outstanding_tx++;
+            xsk_info->stats.tx_bytes += 60;
+            xsk_info->stats.tx_packets++;
         }
 
-        xsk_ring_prod__submit(&xsk_info->tx, RX_BATCH_SIZE);
-//        printf("submitted\n");
-        xsk_info->outstanding_tx++;
-        xsk_info->stats.tx_bytes += 60 * RX_BATCH_SIZE;
-        xsk_info->stats.tx_packets += RX_BATCH_SIZE;
+        xsk_ring_prod__submit(&xsk_info->tx,
+                              BATCH_SIZE);
 
-        complete_tx(xsk_info);
+        while (xsk_info->outstanding_tx)
+            complete_tx(xsk_info);
 
-//        printf("tx completed\n");
+
     }
+
     printf("WP: send done\n");
 }
 

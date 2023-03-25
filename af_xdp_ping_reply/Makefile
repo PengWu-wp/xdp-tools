@@ -6,7 +6,7 @@ XDP_TARGETS  := af_xdp_kern
 #TEST_FILE := tests/test-xdp-loader.sh
 #MAN_PAGE := xdp-loader.8
 
-USER_LIBS := -lpthread
+USER_LIBS := -lpthread 
 
 LIB_DIR = ../lib
 
